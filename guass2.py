@@ -548,137 +548,222 @@ def get_weights(a_vec):
     weights = u5 @ np.linalg.inv(np.array([u2, u10]))
     return weights
 
+# ==========================================
+# 1. 策略参数与实战成本设定
+# ==========================================
+notional_5y = 100_000_000  # 1亿美元 5y 做空 (Belly)
+cost_bps = 0.2             # 单边交易成本 (买卖价差 + 佣金) 0.2 bp
+reb_threshold = 0.05       # 调仓带：权重偏离超过 5% 才会触发调仓交易
+
+# 假设 alpha_params 已经定义，获取静态 Yield Beta
 b2y, b10y = get_weights(alpha_params)
-print(f"对冲配比: 1份 5y 需对应 {b2y:.3f}份 2y 和 {b10y:.3f}份 10y")
 
-# 3. 构建蝶式组合残差 (Butterfly Spread)
-# Fly = Res_5y - (beta2 * Res_2y + beta10 * Res_10y)
+# ==========================================
+# 2. 预计算动态 DV01 与 信号
+# ==========================================
+def calc_dv01(yield_series, tau):
+    # 将百分比收益率转为小数 (例如 4.0 -> 0.04)
+    y = yield_series / 100 if yield_series.max() > 1 else yield_series
+    price = 100 / ((1 + y) ** tau)
+    # DV01 = P * Duration_mod * 0.0001
+    return (price * tau * 0.0001) / (1 + y)
+
+# 计算每日市场真实 DV01 (每 100 元面值)
+dv01_2y_ts = calc_dv01(sample_data['SVENY02'], 2)
+dv01_5y_ts = calc_dv01(sample_data['SVENY05'], 5)
+dv01_10y_ts = calc_dv01(sample_data['SVENY10'], 10)
+
+# 信号生成 (基于残差组合)
 res_fly = residuals[5] - (b2y * residuals[2] + b10y * residuals[10])
-
-# 4. 计算交易信号 (60日滚动 Z-Score)
-window = 60
-z_score = (res_fly - res_fly.rolling(window).mean()) / res_fly.rolling(window).std()
-z_score.to_excel('Butterfly_Spread_ZScore.xlsx', index=True)
+z_score = (res_fly - res_fly.rolling(60).mean()) / res_fly.rolling(60).std()
 valid_z = z_score.dropna()
+
 # ==========================================
-# 3. 策略回测逻辑 (接续您的 Z-Score 计算)
+# 3. 核心函数重构：增加信号追踪功能
 # ==========================================
-def run_backtest(entry_thresh, exit_targ, max_hold):
+def run_pro_backtest(entry_thresh, exit_targ, max_hold):
     in_trade = False
-    entry_price = 0
-    entry_idx = 0
-    trades = []
+    equity_curve = [0.0]
+    total_fees = 0
+    hold_n2, hold_n10 = 0.0, 0.0
     
-    for i in range(len(valid_z)):
-        current_date = valid_z.index[i]
-        current_z = valid_z.iloc[i]
-        current_fly_price = res_fly.loc[current_date]
+    # 新增：详细的交易清单和信号日志
+    trade_list = []  # 记录每一笔完整交易
+    signals_log = [] # 记录每一个信号点点用于绘图
+    
+    entry_equity_pre_cost = 0.0
+    entry_date = None
+    entry_z = 0.0
+    
+    common_dates = valid_z.index
+    
+    for i in range(1, len(common_dates)):
+        date = common_dates[i]
+        prev_date = common_dates[i-1]
+        z = valid_z.loc[date]
+        
+        # 理论最优权重计算
+        target_n2 = notional_5y * b2y * (dv01_5y_ts.loc[date] / dv01_2y_ts.loc[date])
+        target_n10 = notional_5y * b10y * (dv01_5y_ts.loc[date] / dv01_10y_ts.loc[date])
+        
+        # 计算今日持仓损益
+        d_spread = res_fly.loc[date] - res_fly.loc[prev_date]
+        cash_dv01_5y = notional_5y * (dv01_5y_ts.loc[date] / 100)
+        pnl_today = d_spread * cash_dv01_5y if in_trade else 0
+        current_equity = equity_curve[-1] + pnl_today
         
         if not in_trade:
-            if current_z < entry_thresh:
+            if z < entry_thresh:
                 in_trade = True
-                entry_price = current_fly_price
                 entry_idx = i
+                entry_date = date
+                entry_z = z
+                entry_equity_pre_cost = equity_curve[-1] # 记录建仓前的总净值
+                
+                # --- 建立头寸并支付成本 ---
+                hold_n2, hold_n10 = target_n2, target_n10
+                total_volume = notional_5y + hold_n2 + hold_n10
+                fee = total_volume * (cost_bps / 10000)
+                total_fees += fee
+                current_equity -= fee
+                
+                signals_log.append({'Date': date, 'Type': 'Entry', 'Equity': current_equity, 'Z': z})
         else:
             days_held = i - entry_idx
-            if current_z > exit_targ or days_held >= max_hold:
+            # 检查出场条件
+            is_target_exit = z > exit_targ
+            is_time_exit = days_held >= max_hold
+            
+            if is_target_exit or is_time_exit:
                 in_trade = False
-                exit_price = current_fly_price
-                pnl = exit_price - entry_price
-                trades.append(pnl)
+                # --- 平仓并支付成本 ---
+                total_volume = notional_5y + hold_n2 + hold_n10
+                fee = total_volume * (cost_bps / 10000)
+                total_fees += fee
+                current_equity -= fee
+                
+                # 计算这笔交易的纯利润 (Exit Equity - Pre-Entry Equity)
+                trade_net_pnl = current_equity - entry_equity_pre_cost
+                
+                # 存入交易清单
+                trade_list.append({
+                    'Entry_Date': entry_date,
+                    'Exit_Date': date,
+                    'Holding_Days': days_held,
+                    'PnL_USD': trade_net_pnl,
+                    'Entry_Z': entry_z,
+                    'Exit_Z': z,
+                    'Exit_Reason': 'Target' if is_target_exit else 'TimeLimit'
+                })
+                
+                signals_log.append({'Date': date, 'Type': 'Exit', 'Equity': current_equity, 'Z': z})
+                hold_n2, hold_n10 = 0.0, 0.0
+            else:
+                # 调仓检查
+                diff_2 = abs(hold_n2 - target_n2) / target_n2
+                diff_10 = abs(hold_n10 - target_n10) / target_n10
+                if diff_2 > reb_threshold or diff_10 > reb_threshold:
+                    reb_vol = abs(hold_n2 - target_n2) + abs(hold_n10 - target_n10)
+                    fee = reb_vol * (cost_bps / 10000)
+                    total_fees += fee
+                    current_equity -= fee
+                    hold_n2, hold_n10 = target_n2, target_n10
+                    
+        equity_curve.append(current_equity)
+        
+    return equity_curve, total_fees, pd.DataFrame(trade_list), pd.DataFrame(signals_log)
+
+# ==========================================
+# 4. 参数寻优循环 (Grid Search) - 增加胜率统计
+# ==========================================
+entry_range = [-1.0, -1.2, -1.5, -1.8, -2.0]
+exit_range  = [0.0, 0.3, 0.5, 0.8, 1.0]
+hold_range  = [20, 30, 45, 60, 90]
+
+# ==========================================
+# 4. 参数寻优循环 (修改后的修复版本)
+# ==========================================
+search_results = []
+
+for et, xt, mh in itertools.product(entry_range, exit_range, hold_range):
+    # run_pro_backtest 返回的第 3 个值是 trades_df (DataFrame)
+    equity, fees, trades_df, _ = run_pro_backtest(et, xt, mh)
     
-    if len(trades) == 0:
-        return 0, 0, 0, 0
+    if len(trades_df) >= 5:
+        # --- 修复位置：统计 PnL_USD 列中大于 0 的个数 ---
+        # trades_df['PnL_USD'] > 0 会返回一个布尔序列，.sum() 会统计 True 的个数
+        win_count = (trades_df['PnL_USD'] > 0).sum()
+        win_rate = win_count / len(trades_df)
+        
+        search_results.append({
+            'entry_thresh': et, 
+            'exit_targ': xt, 
+            'max_hold': mh,
+            'total_net_pnl': equity[-1], 
+            'num_trades': len(trades_df),
+            'win_rate': win_rate
+        })
+# 转换为 DataFrame 并排序
+optimization_df = pd.DataFrame(search_results)
+best_row = optimization_df.sort_values('total_net_pnl', ascending=False).iloc[0]
+
+# 保存完整的网格搜索结果
+optimization_df.to_excel('pro_backtest_grid_search_results.xlsx', index=False)
+
+best_entry = best_row['entry_thresh']
+best_exit = best_row['exit_targ']
+best_hold = int(best_row['max_hold'])
+
+print(f"\n寻优完成！最佳参数组合：")
+print(f"Entry: {best_entry} | Exit: {best_exit} | Hold: {best_hold}")
+print(f"总净利润: ${best_row['total_net_pnl']:,.2f} | 胜率: {best_row['win_rate']:.2%}")
+
+# ==========================================
+# 5. 使用最佳参数运行最终回测并绘图
+# ==========================================
+net_equity, total_cost, trades_final, df_signals = run_pro_backtest(best_entry, best_exit, best_hold)
+
+# --- 修复位置：使用 Pandas 的方式计算胜率 ---
+if not trades_final.empty:
+    final_win_rate = (trades_final['PnL_USD'] > 0).mean()
+else:
+    final_win_rate = 0
+
     
-    total_pnl = sum(trades)
-    win_ratio = sum(1 for p in trades if p > 0) / len(trades)
-    avg_pnl = total_pnl / len(trades)
-    return total_pnl, win_ratio, avg_pnl, len(trades)
+plt.figure(figsize=(14, 12))
 
-# Define parameter ranges for optimization
-entry_range = [-1.0, -1.5, -2.0, -2.5]
-exit_range = [0.0, 0.5, 1.0, 1.5]
-hold_range = [30, 45, 60, 75, 90]
-
-results = []
-for entry_t, exit_t, hold_d in itertools.product(entry_range, exit_range, hold_range):
-    total_p, win_r, avg_p, n_trades = run_backtest(entry_t, exit_t, hold_d)
-    results.append({
-        'entry_threshold': entry_t,
-        'exit_target': exit_t,
-        'max_hold_days': hold_d,
-        'total_pnl': total_p,
-        'win_ratio': win_r,
-        'avg_pnl': avg_p,
-        'num_trades': n_trades
-    })
-
-results_df = pd.DataFrame(results)
-# Strategy: Maximize Total PnL but ensure at least 5 trades to avoid overfitting to one outlier
-best_params = results_df[results_df['num_trades'] >= 5].sort_values('total_pnl', ascending=False).iloc[0]
-
-print("Best Parameters Found:")
-print(best_params)
-
-# Re-run the best one to get full logs and plots
-best_entry = best_params['entry_threshold']
-best_exit = best_params['exit_target']
-best_hold = int(best_params['max_hold_days'])
-
-in_trade = False
-trades = []
-signals_log = []
-for i in range(len(valid_z)):
-    current_date = valid_z.index[i]
-    current_z = valid_z.iloc[i]
-    current_fly_price = res_fly.loc[current_date]
-    if not in_trade:
-        if current_z < best_entry:
-            in_trade = True
-            entry_price = current_fly_price
-            entry_date = current_date
-            entry_idx = i
-            signals_log.append({'Date': current_date, 'Type': 'ENTRY', 'Z_Score': current_z, 'Fly_Spread': current_fly_price})
-    else:
-        days_held = i - entry_idx
-        if current_z > best_exit or days_held >= best_hold:
-            in_trade = False
-            exit_price = current_fly_price
-            pnl = exit_price - entry_price
-            trades.append({'Entry_Date': entry_date, 'Exit_Date': current_date, 'Hold_Days': days_held, 'Entry_Spread': entry_price, 'Exit_Spread': exit_price, 'PnL_BPS': pnl, 'Result': 'WIN' if pnl > 0 else 'LOSS'})
-            signals_log.append({'Date': current_date, 'Type': 'EXIT', 'Z_Score': current_z, 'Fly_Spread': current_fly_price, 'PnL_BPS': pnl})
-
-df_trades = pd.DataFrame(trades)
-df_signals = pd.DataFrame(signals_log)
-
-df_trades.to_csv('best_butterfly_trades.csv', index=False)
-df_signals.to_csv('best_butterfly_signals.csv', index=False)
-
-# Plotting the best result
-plt.figure(figsize=(12, 10))
+# --- 子图 1: 权益曲线 + 信号标记 ---
 plt.subplot(2, 1, 1)
-plt.plot(res_fly, label='5y-2y-10y Fly Residual (BPS)', color='purple', alpha=0.5)
-entries = df_signals[df_signals['Type'] == 'ENTRY']
-exits = df_signals[df_signals['Type'] == 'EXIT']
-plt.scatter(entries['Date'], entries['Fly_Spread'], color='red', marker='^', s=60, label='Entry')
-plt.scatter(exits['Date'], exits['Fly_Spread'], color='green', marker='v', s=60, label='Exit')
-plt.axhline(0, color='black', linestyle='--')
-plt.title(f"Best Butterfly Spread (Entry={best_entry}, Exit={best_exit}, Hold={best_hold})")
-plt.legend()
-plt.grid(True, alpha=0.2)
+plt.plot(valid_z.index, net_equity, label='Net Equity (After Costs)', color='darkgreen', linewidth=1.5, alpha=0.8)
 
-plt.subplot(2, 1, 2)
-plt.plot(z_score, label='Rolling Z-Score', color='blue', alpha=0.6)
-plt.fill_between(z_score.index, best_entry, z_score, 
-                 where=(z_score < best_entry), 
-                 color='red', alpha=0.2, label='Entry Zone')
-plt.scatter(entries['Date'], entries['Z_Score'], color='red', marker='^', s=60)
-plt.scatter(exits['Date'], exits['Z_Score'], color='green', marker='v', s=60)
-plt.axhline(best_entry, color='red', linestyle='--', alpha=0.5)
-plt.axhline(best_exit, color='green', linestyle=':', alpha=0.5)
-plt.title(f"Trading Signal: Z-Score < {best_entry} (Win Ratio {best_params['win_ratio']:.2%})")
+if not df_signals.empty:
+    entries = df_signals[df_signals['Type'] == 'Entry']
+    exits = df_signals[df_signals['Type'] == 'Exit']
+    plt.scatter(entries['Date'], entries['Equity'], marker='^', color='red', s=100, label='Short 5Y (Entry)', zorder=5)
+    plt.scatter(exits['Date'], exits['Equity'], marker='v', color='lime', s=100, label='Cover (Exit)', zorder=5)
+
+plt.title(f"Optimized Equity Curve (Net: ${net_equity[-1]:,.0f} | Win Rate: {final_win_rate:.1%})", fontsize=14)
+plt.ylabel("Cumulative USD PnL")
 plt.legend()
-plt.grid(True, alpha=0.2)
+plt.grid(True, alpha=0.3)
+
+# --- 子图 2: Z-Score + 信号标记 ---
+plt.subplot(2, 1, 2)
+plt.plot(z_score.index, z_score, label='Rolling Z-Score', color='royalblue', alpha=0.5)
+plt.fill_between(z_score.index, best_entry, z_score, where=(z_score < best_entry), color='red', alpha=0.15)
+
+if not df_signals.empty:
+    plt.scatter(entries['Date'], entries['Z'], marker='^', color='red', s=100, zorder=5)
+    plt.scatter(exits['Date'], exits['Z'], marker='v', color='lime', s=100, zorder=5)
+
+plt.axhline(best_entry, color='red', linestyle='--', label=f'Entry: {best_entry}')
+plt.axhline(best_exit, color='green', linestyle=':', label=f'Exit: {best_exit}')
+plt.title(f"Signal Analysis: {len(trades_final)} Trades Executed", fontsize=14)
+plt.ylabel("Z-Score")
+plt.legend()
+
 plt.tight_layout()
-plt.savefig('best_butterfly_backtest.png')
-print("Optimized backtest complete.")
+plt.show()
+
+# 保存流水
+trades_final.to_csv('trade_execution_log.csv', index=False)
