@@ -1,0 +1,17 @@
+[
+    {
+        "name": "浦东办公楼",
+        "start": "2026-04-03",
+        "end": "2028-04-02",
+        "cycle_rent": 30000.0,
+        "rent": 30000.0,
+        "payment_freq": 1,
+        "is_prepaid": false,
+        "free": 0,
+        "prepaid": 30000.0,
+        "rate": 0.0435,
+        "tax": 0.25,
+        "vat": 0.09,
+        "mod_history": []
+    }
+]
