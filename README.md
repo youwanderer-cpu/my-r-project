@@ -69,3 +69,50 @@ my-r-project/
     ├── leases_db.json                                               # 租赁合同核心台账库
     ├── users.json                                                   # 加盐哈希加密后的用户凭证库
     └── operation_logs.csv                                           # 实时审计追踪日志(全操作留痕)
+
+1. 用户凭证加密库 (users.json)
+默认初始化包含两个安全隔离的账户：
+
+JSON
+{
+    "admin": {
+        "password_hash": "6217c3d8160df24ba45b1ea8bd7446ae8136b543f0c14de3ce87dfcde0148d75",
+        "role": "manager",
+        "name": "财务经理"
+    },
+    "user": {
+        "password_hash": "58472793ddf58fdae331c5089b6e63f128dc9b90a39170d38c17cc45fc0c2db1",
+        "role": "viewer",
+        "name": "普通会计"
+    }
+}
+安全提示：初始化脚本内置安全盐值 SALT = "Lease_Project_2026"。默认初始密码分别为 Manager2026 和 Staff2026。
+
+2. 审计留痕日志 (operation_logs.csv)
+任何登录、资产新增、租赁变更重估或删除操作，系统都将在底层自动向 operation_logs.csv 追加一条记录，包含：时间、操作用户、用户角色、操作类型 以及 详细改动参数。这为外部审计（如年报审计）提供了强有力的控制测试轨迹。
+
+📊 自动化审计底稿 (Excel 导出结构)
+点击系统中的“导出高级 Excel 报表”按钮，系统会调用后端引擎自动生成一个格式高度美化、符合四大审计底稿规范的 .xlsx 工作簿，内含 4 个核心页签（Tabs）：
+
+📊 全周期明细 (Amortization Schedule)：逐月列示自合同开始日至结束日的现金流、期初负债、本期应计利息、本期应付租金、期末负债、使用权资产期初、本期折旧、使用权资产期末净值等 10 余项关键指标。
+
+📋 月末财务快照汇总 (Monthly Summary)：按自然月度进行横向加总，提供全公司视角下的“月末租赁负债余额”、“月末使用权资产净值”以及“当月利息/折旧总额”，用于总账会计直接编制月度结账分录。
+
+🔑 初始合同清单 (Initial Recognition)：抽取所有资产的初始账面信息，包含合同名、现值、未确认融资费用初始总额、初始使用权资产原值。
+
+🔄 租赁变更记录 (Modification Trace)：将所有历史发生的重估记录进行追溯列示，清晰对比变更前后的租金、折现率、到期日以及重估引发的资产负债调整额。
+
+🚀 部署与运行指南
+1. 环境依赖安装
+在您的本地电脑（或服务器终端）中，运行以下命令安装系统所需的 Python 库：
+
+Bash
+pip install streamlit pandas numpy python-dateutil xlsxwriter
+2. 首次运行
+在终端切换到项目目录并运行主程序：
+
+Bash
+cd lease
+streamlit run lease_calculator_VAT_offline_modified_access_audit_final.py
+3. 生产安全建议
+请在生产环境部署前，修改 import_hashlib.py 与主脚本中的 SALT 字符串。
