@@ -1,0 +1,12 @@
+{
+    "admin": {
+        "password_hash": "6217c3d8160df24ba45b1ea8bd7446ae8136b543f0c14de3ce87dfcde0148d75",
+        "role": "manager",
+        "name": "财务经理"
+    },
+    "user": {
+        "password_hash": "58472793ddf58fdae331c5089b6e63f128dc9b90a39170d38c17cc45fc0c2db1",
+        "role": "viewer",
+        "name": "普通会计"
+    }
+}
